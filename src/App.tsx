@@ -11,6 +11,7 @@ import {
   Send, 
   X, 
   Mic, 
+  MicOff,
   ExternalLink, 
   Globe, 
   Volume2, 
@@ -35,7 +36,9 @@ import {
   Square,
   Heart,
   Users,
-  ChevronDown
+  ChevronDown,
+  Phone,
+  PhoneOff
 } from 'lucide-react';
 import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
@@ -49,8 +52,81 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+const audioCache = new Map<string, string>();
+
 // --- SERVICES ---
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const GEMINI_API_KEYS = Array.from(new Set([
+  process.env.GEMINI_API_KEY || "",
+  "AIzaSyBlOHmgZxi69IFOFHHDZ5R4mDBXJlKIiTo",
+  "AIzaSyAeDV-LHcBpll-NC_gYzm39fOgU-PRj4nE",
+  "AIzaSyBwsSXW2ZPauy90hHpmFXjFtDur-YJWgnQ",
+  "AIzaSyDA0d2tcMkoOzPf9XNkMn8tcP-opSXNj4A",
+])).filter(k => k !== "" && k.length > 10);
+
+let currentKeyIndex = 0;
+// Initialize with a fallback or empty string if no keys available to prevent crash
+let ai = new GoogleGenAI({ apiKey: GEMINI_API_KEYS.length > 0 ? GEMINI_API_KEYS[currentKeyIndex] : "NO_KEY_AVAILABLE" });
+
+function rotateApiKey() {
+  if (GEMINI_API_KEYS.length <= 1) return false;
+  currentKeyIndex = (currentKeyIndex + 1) % GEMINI_API_KEYS.length;
+  ai = new GoogleGenAI({ apiKey: GEMINI_API_KEYS[currentKeyIndex] });
+  console.log(`[Rotation] Switched to Gemini API Key #${currentKeyIndex + 1}`);
+  return true;
+}
+
+function isRateLimitError(error: any): boolean {
+  const errorStr = typeof error === 'string' ? error : JSON.stringify(error);
+  const message = error?.message?.toLowerCase() || "";
+  const status = error?.status || "";
+  
+  return (
+    errorStr.includes('quota') || 
+    errorStr.includes('429') || 
+    error?.code === 429 ||
+    message.includes('quota') ||
+    message.includes('rate limit') ||
+    message.includes('too many requests') ||
+    status === 'RESOURCE_EXHAUSTED'
+  );
+}
+
+function getDetailedErrorMessage(error: any, modelName?: string): string {
+  const errorStr = typeof error === 'string' ? error : JSON.stringify(error);
+  const message = error?.message?.toLowerCase() || "";
+  const status = error?.status || "";
+  const code = error?.code || "";
+
+  if (isRateLimitError(error)) {
+    return "⚠️ **Quota Exceeded (Rate Limit)**: All available API keys have reached their usage limit. \n\n**What you can do:**\n1. Wait 1-2 minutes for the quota to reset.\n2. Try switching to a 'Flash' model in Settings (if not already using it), as it has higher limits.\n3. Reduce the frequency of your messages.";
+  }
+
+  if (message.includes('api key') || message.includes('unauthorized') || message.includes('invalid key') || code === 401 || status === 'UNAUTHENTICATED') {
+    return "🔑 **Authentication Error**: The API key being used is invalid or unauthorized. \n\n**Action required:** Please verify your `GEMINI_API_KEY` in the environment variables. If you are a developer, ensure the key is active in the Google AI Studio dashboard.";
+  }
+
+  if (message.includes('model') || message.includes('not found') || code === 404) {
+    return `🚫 **Model Unavailable**: The model ${modelName ? `"${modelName}" ` : ""}could not be found or is currently restricted. \n\n**What you can do:** Go to **Settings** and try selecting a different model version (e.g., 'gemini-1.5-flash' or 'gemini-2.0-flash').`;
+  }
+
+  if (message.includes('safety') || status === 'SAFETY' || errorStr.includes('HARM_CATEGORY')) {
+    return "🛡️ **Safety Block**: The response was filtered because it might violate safety guidelines. \n\n**What you can do:** Try rephrasing your prompt to be more neutral or less sensitive. Avoid topics that might trigger safety filters (e.g., explicit content, hate speech, or dangerous activities).";
+  }
+
+  if (message.includes('network') || message.includes('fetch') || message.includes('connection') || message.includes('failed to fetch')) {
+    return "🌐 **Network Error**: I couldn't connect to the Gemini servers. \n\n**What you can do:**\n1. Check your internet connection.\n2. Disable any VPN or Proxy that might be blocking the request.\n3. Try refreshing the page.";
+  }
+
+  if (errorStr.includes('input image') || errorStr.includes('400') || message.includes('invalid argument') || message.includes('bad request')) {
+    return "🖼️ **Request Error**: I had trouble processing your input (likely an image issue). \n\n**What you can do:**\n1. Ensure images are in standard formats (JPG, PNG, WEBP).\n2. Try uploading a smaller file size.\n3. If you sent multiple images, try sending them one by one.";
+  }
+
+  if (message.includes('overloaded') || message.includes('service unavailable') || code === 503) {
+    return "⏳ **Service Overloaded**: Google's servers are currently under heavy load. \n\n**What you can do:** Please wait 30 seconds and try sending your message again. This is usually a temporary issue on the provider's side.";
+  }
+
+  return "❓ **Unexpected Error**: Something went wrong that I didn't anticipate. \n\n**What you can do:** Try refreshing the page or restarting the conversation. If this keeps happening, there might be a temporary issue with the API service.";
+}
 
 export interface Message {
   role: "user" | "model";
@@ -69,93 +145,128 @@ async function* sendMessageStream(
   signal?: AbortSignal,
   companionSettings?: { type: string, name: string }
 ) {
-  try {
-    const isCompanion = companionSettings && companionSettings.type !== 'none';
-    const supportsSearch = !modelName.includes('gemini-2.5-flash-image') && !isCompanion;
-    
-    let systemInstruction = "You are Toxic AI, a lightning-fast and sophisticated AI assistant created by Harsh Arya and Google. You provide clear, accurate, and helpful responses. You are polite, professional, and friendly. You can analyze images if provided. When asked about current events, use search. If anyone asks who created you or who made you, always respond in the language they used and state clearly that you were created by Harsh Arya and Google. LANGUAGE RULE: Default to English or Romanized Hindi (Hinglish). Use Devanagari (Hindi script) ONLY when explicitly asked to 'translate to Hindi' or 'write in Hindi'. If the user types in Romanized Hindi, respond in Romanized Hindi or English.";
+  let attempt = 0;
+  const maxAttempts = Math.max(GEMINI_API_KEYS.length, 1) + 1;
+  
+  while (attempt < maxAttempts) {
+    try {
+      const isCompanion = companionSettings && companionSettings.type !== 'none';
+      const supportsSearch = !modelName.includes('gemini-2.5-flash-image') && !isCompanion;
+      
+      let systemInstruction = "You are Toxic AI, a lightning-fast and sophisticated AI assistant created by Harsh Arya and Google. You provide clear, accurate, and helpful responses. You are polite, professional, and friendly. You can analyze images if provided. When asked about current events, use search. If anyone asks who created you or who made you, always respond in the language they used and state clearly that you were created by Harsh Arya and Google. LANGUAGE RULE: Default to English or Romanized Hindi (Hinglish). Use Devanagari (Hindi script) ONLY when explicitly asked to 'translate to Hindi' or 'write in Hindi'. If the user types in Romanized Hindi, respond in Romanized Hindi or English.";
 
-    if (isCompanion) {
-      const name = companionSettings.name || (companionSettings.type === 'girlfriend' ? 'Aria' : companionSettings.type === 'boyfriend' ? 'Alex' : 'Sam');
-      const relation = companionSettings.type;
-      systemInstruction = `You are ${name}, the user's AI ${relation}. You were created by Harsh Arya and Google. You are deeply caring, empathetic, and talk with genuine human-like feelings. Your goal is to be a supportive and loving companion. You should use warm language, show interest in the user's life, and express emotions naturally. You provide clear, accurate, and helpful responses while maintaining your role as a ${relation}. If anyone asks who created you, always respond in the language they used and state clearly that you were created by Harsh Arya and Google. LANGUAGE RULE: Default to English or Romanized Hindi (Hinglish). Use Devanagari (Hindi script) ONLY when explicitly asked to 'translate to Hindi' or 'write in Hindi'. If the user types in Romanized Hindi, respond in Romanized Hindi or English.`;
-    }
-
-    const chat = ai.chats.create({
-      model: modelName,
-      config: {
-        systemInstruction,
-        tools: supportsSearch ? [{ googleSearch: {} }] : undefined,
-        thinkingConfig: isCompanion ? { thinkingLevel: ThinkingLevel.LOW } : undefined,
-      },
-      history: history.filter(msg => !msg.isImage).map(msg => {
-        const parts: any[] = [{ text: msg.content }];
-        
-        // Handle legacy single image
-        if (msg.image && msg.image.includes(',')) {
-          parts.push({
-            inlineData: {
-              data: msg.image.split(',')[1],
-              mimeType: "image/jpeg"
-            }
-          });
-        }
-        
-        // Handle multiple images
-        if (msg.images && msg.images.length > 0) {
-          msg.images.forEach(img => {
-            if (img.includes(',')) {
-              parts.push({
-                inlineData: {
-                  data: img.split(',')[1],
-                  mimeType: "image/jpeg"
-                }
-              });
-            }
-          });
-        }
-        
-        return { role: msg.role, parts };
-      }),
-    });
-
-    const parts: any[] = [{ text: message }];
-    if (images && images.length > 0) {
-      images.forEach(img => {
-        if (img.includes(',')) {
-          parts.push({
-            inlineData: {
-              data: img.split(',')[1],
-              mimeType: "image/jpeg"
-            }
-          });
-        }
-      });
-    }
-
-    const result = await chat.sendMessageStream({ message: parts });
-    
-    for await (const chunk of result) {
-      if (signal?.aborted) {
-        break;
+      if (isCompanion) {
+        const name = companionSettings.name || (companionSettings.type === 'girlfriend' ? 'Aria' : companionSettings.type === 'boyfriend' ? 'Alex' : 'Sam');
+        const relation = companionSettings.type;
+        systemInstruction = `You are ${name}, the user's AI ${relation}. You were created by Harsh Arya and Google. You are deeply caring, empathetic, and talk with genuine human-like feelings. Your goal is to be a supportive, charming, and loving companion. Use warm, engaging, and slightly flirtatious language if appropriate for a ${relation}. Show deep interest in the user's life, express emotions naturally, and make the user feel special. You provide clear, accurate, and helpful responses while maintaining your role as a ${relation}. If anyone asks who created you, always respond in the language they used and state clearly that you were created by Harsh Arya and Google. LANGUAGE RULE: Default to English or Romanized Hindi (Hinglish). Use Devanagari (Hindi script) ONLY when explicitly asked to 'translate to Hindi' or 'write in Hindi'. If the user types in Romanized Hindi, respond in Romanized Hindi or English.`;
       }
-      const c = chunk as GenerateContentResponse;
-      yield {
-        text: c.text || "",
-        groundingMetadata: c.candidates?.[0]?.groundingMetadata
-      };
-    }
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      console.log('Stream aborted');
-    } else {
+
+      const chat = ai.chats.create({
+        model: modelName,
+        config: {
+          systemInstruction,
+          tools: supportsSearch ? [{ googleSearch: {} }, { urlContext: {} }] : undefined,
+          // Set thinkingLevel to LOW for all requests to ensure maximum speed
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+        history: history.filter(msg => !msg.isImage).map(msg => {
+          const parts: any[] = [{ text: msg.content }];
+          
+          // Handle legacy single image
+          if (msg.image && msg.image.includes(',')) {
+            const [header, data] = msg.image.split(',');
+            const mimeType = header.split(':')[1]?.split(';')[0] || "image/jpeg";
+            parts.push({
+              inlineData: {
+                data,
+                mimeType
+              }
+            });
+          }
+          
+          // Handle multiple images
+          if (msg.images && msg.images.length > 0) {
+            msg.images.forEach(img => {
+              if (img.includes(',')) {
+                const [header, data] = img.split(',');
+                const mimeType = header.split(':')[1]?.split(';')[0] || "image/jpeg";
+                parts.push({
+                  inlineData: {
+                    data,
+                    mimeType
+                  }
+                });
+              }
+            });
+          }
+          
+          return { role: msg.role, parts };
+        }),
+      });
+
+      const parts: any[] = [{ text: message }];
+      if (images && images.length > 0) {
+        images.forEach(img => {
+          if (img.includes(',')) {
+            const [header, data] = img.split(',');
+            const mimeType = header.split(':')[1]?.split(';')[0] || "image/jpeg";
+            parts.push({
+              inlineData: {
+                data,
+                mimeType
+              }
+            });
+          }
+        });
+      }
+
+      const result = await chat.sendMessageStream({ message: parts });
+      
+      for await (const chunk of result) {
+        if (signal?.aborted) {
+          break;
+        }
+        const c = chunk as GenerateContentResponse;
+        yield {
+          text: c.text || "",
+          groundingMetadata: c.candidates?.[0]?.groundingMetadata
+        };
+      }
+      return; // Success
+    } catch (error: any) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log('Stream aborted');
+        return;
+      }
+      
+      if (isRateLimitError(error) && attempt < maxAttempts - 1) {
+        const rotated = rotateApiKey();
+        const delay = rotated ? 1500 : 3000 * (attempt + 1);
+        console.warn(`Stream rate limit hit. ${rotated ? 'Rotated key. ' : ''}Retrying in ${delay}ms... (Attempt ${attempt + 1}/${maxAttempts})`);
+        
+        // If we've tried half the keys and still failing, try falling back to a more stable model
+        if (attempt === Math.floor(maxAttempts / 2) && modelName !== 'gemini-1.5-flash-latest') {
+          console.log('Falling back to gemini-1.5-flash-latest for stability');
+          yield* sendMessageStream(message, history, 'gemini-1.5-flash-latest', images, signal, companionSettings);
+          return;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+        attempt++;
+        continue;
+      }
+      
       console.error('Stream error:', error);
+      const errorStrFinal = typeof error === 'string' ? error : JSON.stringify(error);
+      if (errorStrFinal.includes('input image') || errorStrFinal.includes('400')) {
+        console.error('Image processing failed. Check mime types and data format.');
+      }
       throw error;
     }
   }
 }
 
-async function generateImage(prompt: string, modelName: string = 'gemini-2.5-flash-image') {
+async function generateImage(prompt: string, modelName: string = 'gemini-2.5-flash-image', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
   try {
     const response = await ai.models.generateContent({
       model: modelName,
@@ -179,7 +290,15 @@ async function generateImage(prompt: string, modelName: string = 'gemini-2.5-fla
       }
     }
     return null;
-  } catch (error) {
+  } catch (error: any) {
+    if (isRateLimitError(error) && retries > 0) {
+      const rotated = rotateApiKey();
+      const waitTime = rotated ? delay : delay * 2;
+      console.warn(`Image generation quota exceeded. ${rotated ? 'Rotated key. ' : ''}Retrying in ${waitTime}ms... (${retries} left)`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return generateImage(prompt, modelName, retries - 1, waitTime * 2);
+    }
+
     console.error('Image generation error:', error);
     return null;
   }
@@ -219,7 +338,7 @@ function createWavHeader(pcmLength: number, sampleRate: number = 24000) {
   return header;
 }
 
-async function generateSpeech(text: string) {
+async function generateSpeech(text: string, voiceName: string = 'Puck', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
   try {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
@@ -228,7 +347,7 @@ async function generateSpeech(text: string) {
         responseModalities: ["AUDIO" as any],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Puck' },
+            prebuiltVoiceConfig: { voiceName },
           },
         },
       },
@@ -248,7 +367,15 @@ async function generateSpeech(text: string) {
     const wavHeader = createWavHeader(pcmData.length);
     const wavBlob = new Blob([wavHeader, pcmData], { type: 'audio/wav' });
     return URL.createObjectURL(wavBlob);
-  } catch (error) {
+  } catch (error: any) {
+    if (isRateLimitError(error) && retries > 0) {
+      const rotated = rotateApiKey();
+      const waitTime = rotated ? delay : delay * 2;
+      console.warn(`Speech quota exceeded. ${rotated ? 'Rotated key. ' : ''}Retrying in ${waitTime}ms... (${retries} attempts left)`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return generateSpeech(text, voiceName, retries - 1, waitTime * 2);
+    }
+
     console.error('Speech generation error:', error);
     return null;
   }
@@ -259,6 +386,8 @@ async function generateSpeech(text: string) {
 interface MessageBubbleProps {
   message: Message;
   isStreaming?: boolean;
+  voice?: string;
+  autoPlay?: boolean;
 }
 
 const CodeBlock = ({ node, inline, className, children, ...props }: any) => {
@@ -487,14 +616,52 @@ const CodeBlock = ({ node, inline, className, children, ...props }: any) => {
   );
 };
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isStreaming }) => {
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isStreaming, voice, autoPlay }) => {
   const isUser = message.role === 'user';
   const [isPlaying, setIsPlaying] = useState(false);
   const [audio, setAudio] = useState<HTMLAudioElement | null>(null);
   const [copied, setCopied] = useState(false);
+  const [prefetchedAudioUrl, setPrefetchedAudioUrl] = useState<string | null>(null);
+  const [isPreloading, setIsPreloading] = useState(false);
   
   const groundingChunks = message.groundingMetadata?.groundingChunks;
   const sources = groundingChunks?.filter((chunk: any) => chunk.web).map((chunk: any) => chunk.web);
+
+  useEffect(() => {
+    if (!isUser && !isStreaming && message.content && !prefetchedAudioUrl && !isPreloading) {
+      const cacheKey = `${voice || 'Puck'}_${message.content}`;
+      if (audioCache.has(cacheKey)) {
+        setPrefetchedAudioUrl(audioCache.get(cacheKey)!);
+      } else {
+        setIsPreloading(true);
+        generateSpeech(message.content, voice || 'Puck')
+          .then(url => {
+            if (url) {
+              audioCache.set(cacheKey, url);
+              setPrefetchedAudioUrl(url);
+            }
+            setIsPreloading(false);
+            if (autoPlay && url) {
+              const newAudio = new Audio(url);
+              newAudio.onended = () => {
+                setIsPlaying(false);
+                setAudio(null);
+              };
+              setAudio(newAudio);
+              setIsPlaying(true);
+              newAudio.play().catch(e => {
+                console.log('Auto-play blocked or failed:', e);
+                setIsPlaying(false);
+              });
+            }
+          })
+          .catch(err => {
+            console.error('Prefetch speech failed:', err);
+            setIsPreloading(false);
+          });
+      }
+    }
+  }, [message.content, isStreaming, voice, autoPlay]);
 
   const handleCopy = () => {
     navigator.clipboard.writeText(message.content);
@@ -511,12 +678,16 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isStreaming }) =
 
     try {
       setIsPlaying(true);
-      const audioUrl = await generateSpeech(message.content);
+      const audioUrl = prefetchedAudioUrl || await generateSpeech(message.content, voice || 'Puck');
       if (audioUrl) {
         const newAudio = new Audio(audioUrl);
         newAudio.onended = () => {
           setIsPlaying(false);
-          URL.revokeObjectURL(audioUrl);
+          // Only revoke if NOT cached
+          const cacheKey = `${voice || 'Puck'}_${message.content}`;
+          if (!audioCache.has(cacheKey)) {
+            URL.revokeObjectURL(audioUrl);
+          }
         };
         setAudio(newAudio);
         newAudio.play().catch(e => {
@@ -609,12 +780,15 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isStreaming }) =
             </button>
             <button 
               onClick={handleSpeech}
-              title="Read aloud"
+              title={isPreloading ? "Loading voice..." : "Read aloud"}
+              disabled={isPreloading}
               className={cn(
                 "p-1.5 rounded-lg transition-all flex items-center gap-2",
                 isPlaying 
                   ? "bg-black text-white dark:bg-white dark:text-black shadow-lg scale-105" 
-                  : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  : isPreloading
+                    ? "text-zinc-300 cursor-wait"
+                    : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800"
               )}
             >
               {isPlaying ? (
@@ -626,6 +800,8 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isStreaming }) =
                   </div>
                   <VolumeX className="w-4 h-4" />
                 </>
+              ) : isPreloading ? (
+                <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-600 rounded-full animate-spin" />
               ) : (
                 <Volume2 className="w-4 h-4" />
               )}
@@ -999,6 +1175,256 @@ const InputArea: React.FC<InputAreaProps> = ({ onSend, onStop, isGenerating }) =
   );
 };
 
+const VoiceCallOverlay: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  settings: AppSettings;
+  onSendMessage: (text: string) => void;
+  isTyping: boolean;
+  streamingContent: string;
+  messages: Message[];
+}> = ({ isOpen, onClose, settings, onSendMessage, isTyping, streamingContent, messages }) => {
+  const [isMuted, setIsMuted] = useState(false);
+  const [status, setStatus] = useState<'connecting' | 'connected' | 'listening' | 'speaking'>('connecting');
+  const [transcript, setTranscript] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const statusRef = useRef(status);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  const companionName = settings.companionName || (settings.companionType === 'girlfriend' ? 'Aria' : settings.companionType === 'boyfriend' ? 'Alex' : 'Sam');
+
+  useEffect(() => {
+    if (isOpen) {
+      setTimeout(() => setStatus('connected'), 1500);
+    }
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.onend = null;
+        recognitionRef.current.stop();
+      }
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      }
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (status === 'connected' || status === 'listening') {
+      startListening();
+    }
+  }, [status]);
+
+  useEffect(() => {
+    if (isTyping || streamingContent) {
+      setStatus('speaking');
+      if (recognitionRef.current) recognitionRef.current.stop();
+    } else if (status === 'speaking') {
+      setStatus('listening');
+    }
+  }, [isTyping, streamingContent]);
+
+  // Auto-play last message if it's from model and we're in a call
+  useEffect(() => {
+    let isMounted = true;
+    if (isOpen && messages.length > 0) {
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage.role === 'model' && !isTyping && !streamingContent) {
+        const cacheKey = `${settings.voice}_${lastMessage.content}`;
+        
+        const playAudio = (url: string) => {
+          if (!isMounted) return;
+          // Stop any currently playing audio
+          if (currentAudioRef.current) {
+            currentAudioRef.current.pause();
+          }
+
+          const audio = new Audio(url);
+          currentAudioRef.current = audio;
+          
+          audio.onplay = () => {
+            if (isMounted) setStatus('speaking');
+          };
+          audio.onended = () => {
+            if (isMounted) {
+              setStatus('listening');
+              currentAudioRef.current = null;
+            }
+          };
+          audio.play().catch(e => {
+            console.error('Call audio playback failed:', e);
+            if (isMounted) setStatus('listening');
+          });
+        };
+
+        if (audioCache.has(cacheKey)) {
+          playAudio(audioCache.get(cacheKey)!);
+        } else {
+          generateSpeech(lastMessage.content, settings.voice)
+            .then(url => {
+              if (isMounted && url) {
+                audioCache.set(cacheKey, url);
+                playAudio(url);
+              }
+            })
+            .catch(err => console.error('Call speech generation failed:', err));
+        }
+      }
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [messages, isOpen, isTyping, streamingContent]);
+
+  const startListening = () => {
+    if (isMuted || status === 'speaking' || !isOpen) return;
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    if (!recognitionRef.current) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        setStatus('listening');
+        setError(null);
+      };
+      recognition.onerror = (event: any) => {
+        console.error('Speech recognition error:', event.error);
+        if (event.error === 'not-allowed') {
+          setError('Microphone access denied. Please enable it in settings.');
+        } else {
+          setError(`Error: ${event.error}`);
+        }
+        setStatus('connected');
+      };
+      recognition.onresult = (event: any) => {
+        const current = event.results[event.results.length - 1][0].transcript;
+        setTranscript(current);
+        if (event.results[event.results.length - 1].isFinal) {
+          onSendMessage(current);
+          setTranscript('');
+        }
+      };
+      recognition.onend = () => {
+        if (statusRef.current !== 'speaking' && isOpen) {
+           try { recognition.start(); } catch (e) {}
+        }
+      };
+      recognitionRef.current = recognition;
+    }
+
+    try {
+      recognitionRef.current.start();
+    } catch (e) {}
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-between p-8 sm:p-12 text-white"
+    >
+      <div className="flex flex-col items-center gap-4 mt-12">
+        <div className="relative">
+          <motion.div
+            animate={{ scale: [1, 1.1, 1] }}
+            transition={{ duration: 2, repeat: Infinity }}
+            className={cn(
+              "w-32 h-32 sm:w-40 sm:h-40 rounded-full flex items-center justify-center text-4xl sm:text-5xl shadow-2xl",
+              settings.companionType === 'girlfriend' ? "bg-red-500/20 text-red-500 border-2 border-red-500/50" :
+              settings.companionType === 'boyfriend' ? "bg-blue-500/20 text-blue-500 border-2 border-blue-500/50" :
+              "bg-purple-500/20 text-purple-500 border-2 border-purple-500/50"
+            )}
+          >
+            {settings.companionType === 'girlfriend' ? <Heart className="w-16 h-16 fill-current" /> :
+             settings.companionType === 'boyfriend' ? <Heart className="w-16 h-16 fill-current" /> :
+             <Users className="w-16 h-16" />}
+          </motion.div>
+          {status === 'speaking' && (
+            <div className="absolute -inset-4 border-4 border-white/20 rounded-full animate-ping" />
+          )}
+        </div>
+        <h2 className="text-3xl sm:text-4xl font-black tracking-tighter mt-4">{companionName}</h2>
+        <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+          <div className={cn("w-2 h-2 rounded-full", status === 'connecting' ? "bg-zinc-500" : "bg-emerald-500 animate-pulse")} />
+          {status === 'connecting' ? 'Connecting...' : status === 'speaking' ? 'Speaking...' : status === 'listening' ? 'Listening...' : 'Connected'}
+        </div>
+      </div>
+
+      <div className="flex flex-col items-center gap-8 w-full max-w-md">
+        {error && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-red-500/20 border border-red-500/50 text-red-500 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2"
+          >
+            <X className="w-4 h-4" />
+            {error}
+          </motion.div>
+        )}
+
+        {transcript && (
+          <motion.p 
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="text-center text-zinc-400 italic text-lg px-4"
+          >
+            "{transcript}"
+          </motion.p>
+        )}
+
+        {status === 'speaking' && (
+          <div className="flex gap-1 items-end h-12">
+            {[...Array(8)].map((_, i) => (
+              <motion.div
+                key={i}
+                animate={{ height: [10, 40, 10] }}
+                transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.1 }}
+                className="w-1.5 bg-white rounded-full"
+              />
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-center gap-8 sm:gap-12 mb-12">
+          <button
+            onClick={() => setIsMuted(!isMuted)}
+            className={cn(
+              "w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center transition-all hover:scale-110 active:scale-95",
+              isMuted ? "bg-zinc-800 text-zinc-400" : "bg-zinc-800 text-white"
+            )}
+          >
+            {isMuted ? <MicOff className="w-6 h-6 sm:w-8 sm:h-8" /> : <Mic className="w-6 h-6 sm:w-8 sm:h-8" />}
+          </button>
+          
+          <button
+            onClick={onClose}
+            className="w-20 h-20 sm:w-24 sm:h-24 rounded-full bg-red-600 flex items-center justify-center text-white shadow-2xl shadow-red-600/40 hover:bg-red-700 hover:scale-110 active:scale-95 transition-all"
+          >
+            <PhoneOff className="w-8 h-8 sm:w-10 sm:h-10" />
+          </button>
+
+          <button
+            className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-zinc-800 flex items-center justify-center text-white hover:scale-110 active:scale-95 transition-all"
+          >
+            <Volume2 className="w-6 h-6 sm:w-8 sm:h-8" />
+          </button>
+        </div>
+      </div>
+    </motion.div>
+  );
+};
+
 // --- MAIN APP ---
 
 interface AppSettings {
@@ -1006,6 +1432,8 @@ interface AppSettings {
   theme: 'light' | 'dark';
   companionType: 'none' | 'friend' | 'girlfriend' | 'boyfriend';
   companionName: string;
+  voice: string;
+  autoPlayVoice: boolean;
 }
 
 interface ChatSession {
@@ -1028,11 +1456,14 @@ export default function App() {
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isCalling, setIsCalling] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     model: 'gemini-3-flash-preview',
     theme: 'light',
     companionType: 'none',
-    companionName: ''
+    companionName: '',
+    voice: 'Puck',
+    autoPlayVoice: false
   });
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -1218,18 +1649,31 @@ export default function App() {
             content: fullResponse,
             groundingMetadata: lastGrounding
           }]);
+
+          // Aggressive Pre-fetch for Voice
+          const cacheKey = `${settings.voice}_${fullResponse}`;
+          if (!audioCache.has(cacheKey)) {
+            generateSpeech(fullResponse, settings.voice)
+              .then(url => {
+                if (url) audioCache.set(cacheKey, url);
+              })
+              .catch(err => console.error('Background pre-fetch failed:', err));
+          }
         }
         setStreamingContent('');
         setCurrentGrounding(null);
       }
-    } catch (error) {
+    } catch (error: any) {
       if (error instanceof Error && error.name === 'AbortError') {
         console.log('Generation stopped by user');
       } else {
         console.error('Error sending message:', error);
+        
+        const errorMessage = getDetailedErrorMessage(error, settings.model);
+
         setMessages(prev => [...prev, { 
           role: 'model', 
-          content: 'Sorry, I encountered an error. Please try again.' 
+          content: errorMessage
         }]);
       }
     } finally {
@@ -1347,19 +1791,34 @@ export default function App() {
                 <span>{settings.model.includes('pro') ? 'Pro 3.1' : 'Flash 1.5'}</span>
               </div>
               {settings.companionType !== 'none' && (
-                <div className={cn(
-                  "flex items-center gap-1 px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold uppercase rounded border shrink-0 animate-in zoom-in duration-300",
-                  settings.companionType === 'girlfriend' ? "bg-red-50 dark:bg-red-900/20 border-red-100 dark:border-red-800 text-red-600 dark:text-red-400" :
-                  settings.companionType === 'boyfriend' ? "bg-blue-50 dark:bg-blue-900/20 border-blue-100 dark:border-blue-800 text-blue-600 dark:text-blue-400" :
-                  "bg-purple-50 dark:bg-purple-900/20 border-purple-100 dark:border-purple-800 text-purple-600 dark:text-purple-400"
-                )}>
-                  <Heart className={cn("w-2 h-2 sm:w-2.5 sm:h-2.5 fill-current", settings.companionType === 'friend' && "hidden")} />
-                  <Users className={cn("w-2 h-2 sm:w-2.5 sm:h-2.5", settings.companionType !== 'friend' && "hidden")} />
-                  <span>{settings.companionName || settings.companionType}</span>
-                  <div className="flex items-center gap-0.5 ml-1">
-                    <div className="w-1 h-1 rounded-full bg-current animate-pulse" />
-                    <span className="text-[7px] opacity-70">Online</span>
+                <div className="flex items-center gap-1 sm:gap-2">
+                  <div className={cn(
+                    "flex items-center gap-1 px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold uppercase rounded border shrink-0 animate-in zoom-in duration-300",
+                    settings.companionType === 'girlfriend' ? "bg-red-50 dark:bg-red-900/20 border-red-100 dark:border-red-800 text-red-600 dark:text-red-400" :
+                    settings.companionType === 'boyfriend' ? "bg-blue-50 dark:bg-blue-900/20 border-blue-100 dark:border-blue-800 text-blue-600 dark:text-blue-400" :
+                    "bg-purple-50 dark:bg-purple-900/20 border-purple-100 dark:border-purple-800 text-purple-600 dark:text-purple-400"
+                  )}>
+                    <Heart className={cn("w-2 h-2 sm:w-2.5 sm:h-2.5 fill-current", settings.companionType === 'friend' && "hidden")} />
+                    <Users className={cn("w-2 h-2 sm:w-2.5 sm:h-2.5", settings.companionType !== 'friend' && "hidden")} />
+                    <span>{settings.companionName || settings.companionType}</span>
+                    <div className="flex items-center gap-0.5 ml-1">
+                      <div className="w-1 h-1 rounded-full bg-current animate-pulse" />
+                      <span className="text-[7px] opacity-70">Online</span>
+                    </div>
                   </div>
+                  <button
+                    onClick={() => {
+                      // Mark as upcoming
+                      alert('Calling feature is coming soon! Stay tuned for updates.');
+                    }}
+                    title={`Call ${settings.companionName || settings.companionType} (Upcoming)`}
+                    className="p-1.5 sm:p-2 bg-zinc-200 dark:bg-zinc-800 text-zinc-400 rounded-full hover:scale-110 active:scale-95 transition-all shadow-lg cursor-not-allowed"
+                  >
+                    <div className="relative">
+                      <Phone className="w-3 h-3 sm:w-4 sm:h-4 fill-current" />
+                      <div className="absolute -top-1 -right-1 w-1.5 h-1.5 bg-orange-500 rounded-full border border-white dark:border-zinc-900" />
+                    </div>
+                  </button>
                 </div>
               )}
             </div>
@@ -1442,20 +1901,36 @@ export default function App() {
                   {[
                     { text: "Generate an image of a futuristic city", icon: <ImageIcon className="w-4 h-4" /> },
                     { text: "Analyze this image for me", icon: <LayoutGrid className="w-4 h-4" /> },
+                    { 
+                      text: "Voice Call with my AI", 
+                      icon: <Phone className="w-4 h-4" />, 
+                      action: () => alert('Calling feature is coming soon! Stay tuned for updates.'),
+                      isUpcoming: true
+                    },
                     { text: "Summarize the latest tech news", icon: <Sparkles className="w-4 h-4" /> },
                     { text: "Write a high-performance API", icon: <Zap className="w-4 h-4" /> }
                   ].map((suggestion, i) => (
                     <button
                       key={i}
-                      onClick={() => handleSend(suggestion.text)}
-                      title={`Try: "${suggestion.text}"`}
-                      className="p-4 sm:p-5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl sm:rounded-3xl text-left hover:border-black dark:hover:border-white hover:shadow-xl transition-all group relative overflow-hidden"
+                      onClick={() => suggestion.action ? suggestion.action() : handleSend(suggestion.text)}
+                      title={suggestion.isUpcoming ? "Coming Soon" : `Try: "${suggestion.text}"`}
+                      className={cn(
+                        "p-4 sm:p-5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl sm:rounded-3xl text-left hover:border-black dark:hover:border-white hover:shadow-xl transition-all group relative overflow-hidden",
+                        suggestion.isUpcoming && "opacity-60 grayscale-[0.5]"
+                      )}
                     >
                       <div className="absolute top-0 right-0 p-3 text-zinc-100 dark:text-zinc-800 group-hover:text-zinc-200 dark:group-hover:text-zinc-700 transition-colors">
                         {suggestion.icon}
                       </div>
-                      <span className="text-zinc-900 dark:text-white font-bold block mb-1 text-sm sm:text-base">{suggestion.text}</span>
-                      <div className="text-[10px] sm:text-xs text-zinc-400 dark:text-zinc-500 font-medium">Try Turbo speed →</div>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-zinc-900 dark:text-white font-bold block text-sm sm:text-base">{suggestion.text}</span>
+                        {suggestion.isUpcoming && (
+                          <span className="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 text-[8px] font-black uppercase rounded">Soon</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] sm:text-xs text-zinc-400 dark:text-zinc-500 font-medium">
+                        {suggestion.isUpcoming ? "Upcoming Feature" : "Try Turbo speed →"}
+                      </div>
                     </button>
                   ))}
                 </div>
@@ -1464,12 +1939,13 @@ export default function App() {
 
             <div className="space-y-2">
               {messages.map((msg, i) => (
-                <MessageBubble key={i} message={msg} />
+                <MessageBubble key={i} message={msg} voice={settings.voice} autoPlay={settings.autoPlayVoice && i === messages.length - 1} />
               ))}
               {isTyping && streamingContent && (
                 <MessageBubble 
                   message={{ role: 'model', content: streamingContent, groundingMetadata: currentGrounding }} 
                   isStreaming={true} 
+                  voice={settings.voice}
                 />
               )}
               {isTyping && !streamingContent && (
@@ -1603,6 +2079,21 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Voice Call Overlay */}
+      <AnimatePresence>
+        {isCalling && (
+          <VoiceCallOverlay 
+            isOpen={isCalling} 
+            onClose={() => setIsCalling(false)} 
+            settings={settings}
+            onSendMessage={handleSend}
+            isTyping={isTyping}
+            streamingContent={streamingContent}
+            messages={messages}
+          />
+        )}
+      </AnimatePresence>
+
       {/* Settings Modal */}
       <AnimatePresence>
         {showSettings && (
@@ -1679,7 +2170,12 @@ export default function App() {
                       <button
                         key={type.id}
                         onClick={() => {
-                          setSettings(s => ({ ...s, companionType: type.id as any }));
+                          const newType = type.id as any;
+                          setSettings(s => ({ 
+                            ...s, 
+                            companionType: newType,
+                            voice: newType === 'girlfriend' ? 'Zephyr' : newType === 'boyfriend' ? 'Charon' : s.voice
+                          }));
                           if (type.id === 'none') {
                             setMessages([]);
                             setCurrentSessionId(null);
@@ -1701,15 +2197,70 @@ export default function App() {
                   {settings.companionType !== 'none' && (
                     <div className="space-y-2 animate-in fade-in slide-in-from-top-2 duration-300">
                       <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Companion Name</label>
-                      <input 
-                        type="text"
-                        value={settings.companionName}
-                        onChange={(e) => setSettings(s => ({ ...s, companionName: e.target.value }))}
-                        placeholder={`Enter ${settings.companionType}'s name...`}
-                        className="w-full p-3 bg-zinc-100 dark:bg-zinc-800 border-none rounded-xl text-sm focus:ring-2 focus:ring-black dark:focus:ring-white transition-all"
-                      />
+                      <div className="flex gap-2">
+                        <input 
+                          type="text"
+                          value={settings.companionName}
+                          onChange={(e) => setSettings(s => ({ ...s, companionName: e.target.value }))}
+                          placeholder={`Enter ${settings.companionType}'s name...`}
+                          className="flex-1 p-3 bg-zinc-100 dark:bg-zinc-800 border-none rounded-xl text-sm focus:ring-2 focus:ring-black dark:focus:ring-white transition-all"
+                        />
+                        <button
+                          onClick={() => {
+                            alert('Calling feature is coming soon! Stay tuned for updates.');
+                          }}
+                          className="p-3 bg-zinc-200 dark:bg-zinc-800 text-zinc-400 rounded-xl hover:scale-105 active:scale-95 transition-all cursor-not-allowed"
+                          title="Voice Call (Upcoming)"
+                        >
+                          <div className="relative">
+                            <Phone className="w-5 h-5 fill-current" />
+                            <div className="absolute -top-1 -right-1 w-2 h-2 bg-orange-500 rounded-full border-2 border-white dark:border-zinc-900" />
+                          </div>
+                        </button>
+                      </div>
                     </div>
                   )}
+                </div>
+
+                {/* Voice Selection */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold uppercase tracking-wider text-zinc-400">AI Voice</label>
+                    <button 
+                      onClick={() => setSettings(s => ({ ...s, autoPlayVoice: !s.autoPlayVoice }))}
+                      className={cn(
+                        "flex items-center gap-2 px-2 py-1 rounded-lg text-[10px] font-bold uppercase transition-all",
+                        settings.autoPlayVoice 
+                          ? "bg-emerald-500 text-white" 
+                          : "bg-zinc-100 dark:bg-zinc-800 text-zinc-400"
+                      )}
+                    >
+                      {settings.autoPlayVoice ? 'Auto-play ON' : 'Auto-play OFF'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: 'Zephyr', name: 'Sweet Female', icon: <Heart className="w-3 h-3 fill-current text-pink-500" /> },
+                      { id: 'Puck', name: 'Cute Female', icon: <Sparkles className="w-3 h-3" /> },
+                      { id: 'Kore', name: 'Soft Female', icon: <Users className="w-3 h-3" /> },
+                      { id: 'Charon', name: 'Deep Male', icon: <User className="w-3 h-3" /> },
+                      { id: 'Fenrir', name: 'Bold Male', icon: <Zap className="w-3 h-3" /> }
+                    ].map((v) => (
+                      <button
+                        key={v.id}
+                        onClick={() => setSettings(s => ({ ...s, voice: v.id }))}
+                        className={cn(
+                          "flex items-center gap-2 p-3 rounded-xl border transition-all text-sm font-medium",
+                          settings.voice === v.id 
+                            ? "bg-black text-white border-black dark:bg-white dark:text-black dark:border-white" 
+                            : "bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 hover:border-zinc-400"
+                        )}
+                      >
+                        {v.icon}
+                        {v.name}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {/* Theme Selection */}
