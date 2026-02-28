@@ -1,0 +1,5 @@
+{
+  "name": "Toxic AI",
+  "description": "A lightning-fast AI assistant with a sharp personality and real-time search capabilities.",
+  "requestFramePermissions": ["microphone"]
+}

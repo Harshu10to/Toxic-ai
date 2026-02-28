@@ -1,0 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    @apply font-sans antialiased;
+  }
+}
+
+.prose pre {
+  @apply bg-zinc-900 text-zinc-100 p-4 rounded-xl overflow-x-auto my-4;
+}
+
+.prose code {
+  @apply font-mono text-xs px-1 py-0.5 bg-zinc-100 rounded text-zinc-800;
+}
+
+.prose pre code {
+  @apply p-0 bg-transparent text-zinc-100;
+}
