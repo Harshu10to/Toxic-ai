@@ -106,6 +106,7 @@ const GEMINI_API_KEYS = Array.from(new Set([
   import.meta.env.VITE_GEMINI_API_KEY_3 || "",
   import.meta.env.VITE_GEMINI_API_KEY_4 || "",
   import.meta.env.VITE_GEMINI_API_KEY_5 || "",
+  import.meta.env.VITE_GEMINI_API_KEY_6 || "",
 ])).filter(k => k !== "" && k.length > 10);
 
 let currentKeyIndex = 0;
