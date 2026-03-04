@@ -54,6 +54,51 @@ function cn(...inputs: ClassValue[]) {
 
 const audioCache = new Map<string, string>();
 
+// --- REQUEST QUEUE & RATE LIMITING ---
+class RequestQueue {
+  private queue: Array<() => Promise<any>> = [];
+  private isProcessing = false;
+  private lastRequestTime = 0;
+  private minInterval = 500; // 500ms between requests
+  
+  async add<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.process();
+    });
+  }
+  
+  private async process() {
+    if (this.isProcessing || this.queue.length === 0) return;
+    
+    this.isProcessing = true;
+    while (this.queue.length > 0) {
+      const now = Date.now();
+      const timeSinceLastRequest = now - this.lastRequestTime;
+      
+      if (timeSinceLastRequest < this.minInterval) {
+        await new Promise(resolve => setTimeout(resolve, this.minInterval - timeSinceLastRequest));
+      }
+      
+      const fn = this.queue.shift();
+      if (fn) {
+        this.lastRequestTime = Date.now();
+        await fn();
+      }
+    }
+    this.isProcessing = false;
+  }
+}
+
+const requestQueue = new RequestQueue();
+
 // --- SERVICES ---
 const GEMINI_API_KEYS = Array.from(new Set([
   import.meta.env.VITE_GEMINI_API_KEY || "",
@@ -146,10 +191,14 @@ async function* sendMessageStream(
   companionSettings?: { type: string, name: string }
 ) {
   let attempt = 0;
-  const maxAttempts = Math.max(GEMINI_API_KEYS.length, 1) + 1;
+  const maxAttempts = Math.max(GEMINI_API_KEYS.length, 1) + 2;
   
   while (attempt < maxAttempts) {
-    try {
+  try {
+    // Wrap API call in request queue to prevent rate limiting
+    if (attempt === 0) {
+      console.log('[v0] Processing request with queue...');
+    }
       const isCompanion = companionSettings && companionSettings.type !== 'none';
       const supportsSearch = !modelName.includes('gemini-2.5-flash-image') && !isCompanion;
       
@@ -266,19 +315,21 @@ async function* sendMessageStream(
   }
 }
 
-async function generateImage(prompt: string, modelName: string = 'gemini-2.5-flash-image', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
+  async function generateImage(prompt: string, modelName: string = 'gemini-2.5-flash-image', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
   try {
-    const response = await ai.models.generateContent({
-      model: modelName,
-      contents: {
-        parts: [{ text: prompt }],
-      },
-      config: {
-        imageConfig: {
-          aspectRatio: "1:1",
-        },
-      },
+  const response = await requestQueue.add(async () => {
+    return await ai.models.generateContent({
+    model: modelName,
+    contents: {
+    parts: [{ text: prompt }],
+    },
+    config: {
+    imageConfig: {
+    aspectRatio: "1:1",
+    },
+    },
     });
+  });
 
     if (!response.candidates || response.candidates.length === 0) {
       return null;
@@ -338,20 +389,22 @@ function createWavHeader(pcmLength: number, sampleRate: number = 24000) {
   return header;
 }
 
-async function generateSpeech(text: string, voiceName: string = 'Puck', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
+  async function generateSpeech(text: string, voiceName: string = 'Puck', retries = GEMINI_API_KEYS.length, delay = 1500): Promise<string | null> {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text }] }],
-      config: {
-        responseModalities: ["AUDIO" as any],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
-          },
-        },
-      },
+  const response = await requestQueue.add(async () => {
+    return await ai.models.generateContent({
+    model: "gemini-2.5-flash-preview-tts",
+    contents: [{ parts: [{ text }] }],
+    config: {
+    responseModalities: ["AUDIO" as any],
+    speechConfig: {
+    voiceConfig: {
+    prebuiltVoiceConfig: { voiceName },
+    },
+    },
+    },
     });
+  });
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) return null;
