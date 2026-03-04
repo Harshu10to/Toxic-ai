@@ -152,7 +152,7 @@ function getDetailedErrorMessage(error: any, modelName?: string): string {
   }
 
   if (message.includes('model') || message.includes('not found') || code === 404) {
-    return `🚫 **Model Unavailable**: The model ${modelName ? `"${modelName}" ` : ""}could not be found or is currently restricted. \n\n**What you can do:** Go to **Settings** and try selecting a different model version (e.g., 'gemini-1.5-flash' or 'gemini-2.0-flash').`;
+  return `🚫 **Model Unavailable**: The model ${modelName ? `"${modelName}" ` : ""}could not be found or is currently restricted. \n\n**What you can do:** Go to **Settings** and try selecting a different model version (e.g., 'Gemini 2.0 Flash' or 'Gemini 2.0 Pro').`;
   }
 
   if (message.includes('safety') || status === 'SAFETY' || errorStr.includes('HARM_CATEGORY')) {
@@ -295,9 +295,9 @@ async function* sendMessageStream(
         console.warn(`Stream rate limit hit. ${rotated ? 'Rotated key. ' : ''}Retrying in ${delay}ms... (Attempt ${attempt + 1}/${maxAttempts})`);
         
         // If we've tried half the keys and still failing, try falling back to a more stable model
-        if (attempt === Math.floor(maxAttempts / 2) && modelName !== 'gemini-1.5-flash-latest') {
-          console.log('Falling back to gemini-1.5-flash-latest for stability');
-          yield* sendMessageStream(message, history, 'gemini-1.5-flash-latest', images, signal, companionSettings);
+        if (attempt === Math.floor(maxAttempts / 2) && modelName !== 'gemini-2.0-flash-latest') {
+          console.log('Falling back to gemini-2.0-flash-latest for stability');
+          yield* sendMessageStream(message, history, 'gemini-2.0-flash-latest', images, signal, companionSettings);
           return;
         }
 
@@ -1512,12 +1512,12 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isCalling, setIsCalling] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
-    model: 'gemini-3-flash-preview',
-    theme: 'light',
-    companionType: 'none',
-    companionName: '',
-    voice: 'Puck',
-    autoPlayVoice: false
+  model: 'gemini-2.0-flash-latest',
+  theme: 'light',
+  companionType: 'none',
+  companionName: '',
+  voice: 'Puck',
+  autoPlayVoice: false
   });
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -1625,6 +1625,25 @@ export default function App() {
   }, [messages, streamingContent]);
 
   const handleSend = async (content: string, images?: string[]) => {
+    // Input validation
+    const trimmedContent = content.trim();
+    if (!trimmedContent && (!images || images.length === 0)) {
+      console.warn('[v0] Empty message submitted');
+      return;
+    }
+
+    // Check if API keys are available
+    if (GEMINI_API_KEYS.length === 0) {
+      console.error('[v0] No API keys configured');
+      setMessages(prev => [...prev, {
+        role: 'model',
+        content: '🔑 **Configuration Error**: No API keys are configured. Please add your Gemini API keys to the environment variables.'
+      }]);
+      return;
+    }
+
+    console.log(`[v0] Sending message with model: ${settings.model}, Available keys: ${GEMINI_API_KEYS.length}`);
+
     // Initialize session ID if it's a new chat
     let sessionId = currentSessionId;
     if (!sessionId) {
@@ -1632,7 +1651,7 @@ export default function App() {
       setCurrentSessionId(sessionId);
     }
 
-    const userMessage: Message = { role: 'user', content, images };
+    const userMessage: Message = { role: 'user', content: trimmedContent, images };
     setMessages(prev => [...prev, userMessage]);
     setIsTyping(true);
     setStreamingContent('');
@@ -2185,9 +2204,9 @@ export default function App() {
                   <label className="text-xs font-bold uppercase tracking-wider text-zinc-400">AI Model</label>
                   <div className="grid grid-cols-1 gap-2">
                     {[
-                      { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', desc: 'Fastest, great for most tasks' },
-                      { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', desc: 'Advanced reasoning & complex tasks' },
-                      { id: 'gemini-2.5-flash-image', name: 'Nano Banana (Image)', desc: 'Specialized for high-quality image generation' }
+                      { id: 'gemini-2.0-flash-latest', name: 'Gemini 2.0 Flash', desc: 'Fastest, great for most tasks' },
+                      { id: 'gemini-2.0-pro-exp-02-05', name: 'Gemini 2.0 Pro', desc: 'Advanced reasoning & complex tasks' },
+                      { id: 'gemini-2.5-flash-image', name: 'Image Generation', desc: 'Specialized for high-quality image generation' }
                     ].map((m) => (
                       <button
                         key={m.id}
