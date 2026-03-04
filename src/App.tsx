@@ -57,6 +57,10 @@ const audioCache = new Map<string, string>();
 // --- SERVICES ---
 const GEMINI_API_KEYS = Array.from(new Set([
   import.meta.env.VITE_GEMINI_API_KEY || "",
+  import.meta.env.VITE_GEMINI_API_KEY_2 || "",
+  import.meta.env.VITE_GEMINI_API_KEY_3 || "",
+  import.meta.env.VITE_GEMINI_API_KEY_4 || "",
+  import.meta.env.VITE_GEMINI_API_KEY_5 || "",
 ])).filter(k => k !== "" && k.length > 10);
 
 let currentKeyIndex = 0;
